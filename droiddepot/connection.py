@@ -238,8 +238,7 @@ class DroidConnection(AbstractAsyncContextManager):
 
         logger.info("Disconnecting from droid %s", self.address)
         try:
-            await self.motor_controller.set_head_speed(0, 0)
-            await self.motor_controller.set_drive_speed(0, 0)
+            await self.motor_controller.stop_all_motors()
             if not silent:
                 await self.audio_controller.play_shutdown_audio()
         except Exception as err:

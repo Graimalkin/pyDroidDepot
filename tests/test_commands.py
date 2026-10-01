@@ -108,8 +108,18 @@ async def test_disconnect_stops_motors_and_cancels_heartbeat(make_connection):
     await asyncio.sleep(0)
     assert heartbeat.done()
     assert not conn.is_connected
-    # drive motors (0 = left, 1 = right) at speed 0, default ramp 300, delay 0
-    assert conn.clients[0].writes[-2:] == ["290005460000012c0000", "290005460100012c0000"]
+    # disconnect ends with a full stop: the last write zeroes the head going right (0xff)
+    assert conn.clients[0].writes[-1] == "2a420f474402ff00000000"
+    assert "2800054581000000" + "00" in conn.clients[0].writes  # right wheel, backward, zero
+
+
+async def test_stop_zeroes_every_motor_in_both_directions(connected):
+    await connected.motor_controller.stop_all_motors()
+    wheels = ["28000545" + sel + "00" + "00" + "0000" for sel in ("00", "80", "01", "81", "02", "82")]
+    head = []
+    for d in ("00", "ff"):
+        head += ["2a420f474404" + d + "00000000", "2a420f474402" + d + "00000000"]
+    assert connected.droid.writes == wheels + head
 
 
 async def test_heartbeat_runs_on_the_event_loop(make_connection, monkeypatch):
