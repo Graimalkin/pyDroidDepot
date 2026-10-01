@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 from droiddepot.script import DroidScripts, DroidScriptProgrammer
+from droiddepot.motor import DroidMotorDirection
 
 
 async def _no_sleep(*_):
@@ -83,6 +84,19 @@ async def test_center_head_and_drive(connected):
         "27420f444401ff00",
         "29000546" + "00" + "a0" + "012c" + "0000",
         "29000546" + "01" + "a0" + "012c" + "0000",
+    ]
+
+
+async def test_rotation_turns_toward_the_named_side(connected):
+    # Motor select byte is direction nibble (0 forward, 8 backward) + motor (0 left, 1 right).
+    # Turning right = left wheel forward, right wheel backward (verified on a real R2).
+    await connected.motor_controller.set_rotation_speed(DroidMotorDirection.Right, 110, 300)
+    await connected.motor_controller.set_rotation_speed(DroidMotorDirection.Left, 110, 300)
+    assert connected.droid.writes == [
+        "29000546" + "00" + "6e" + "012c" + "0000",
+        "29000546" + "81" + "6e" + "012c" + "0000",
+        "29000546" + "80" + "6e" + "012c" + "0000",
+        "29000546" + "01" + "6e" + "012c" + "0000",
     ]
 
 
