@@ -60,7 +60,7 @@ class DroidPersonalityIdentifier(object):
 
         C110P (int): Identifier for the C1-10P droid.
         CB23 (int): Identifier for the CB-23 droid.
-        BUnit (int): Identifier for the BD unit droid.
+        BDUnit (int): Identifier for the BD unit droid (BUnit is an alias).
         RUnit (int): Identifier for the R unit droid.
         BBUnit (int): Identifier for the BB unit droid.
 
@@ -79,12 +79,16 @@ class DroidPersonalityIdentifier(object):
     DarkBlue = 13
 
     # Droids
-    BUnit = 1
-    RUnit = 2
+    # Droid ids as broadcast in the last byte of the advertisement. Upstream had 1/2/14 assigned to
+    # the wrong droids; these match Droid-Toolbox's table and a real R-series droid (reports 0x01).
+    # The per-droid table rows below were already labelled correctly, so only the numbers changed.
+    RUnit = 1
+    BBUnit = 2
     CB23 = 9
     C110P = 11
     DO = 12
-    BBUnit = 14  
+    BDUnit = 14
+    BUnit = BDUnit  # upstream name for the BD unit, kept for compatibility
 
     ChipAudioCount = {
         DroidAudioBankIdentifier.GeneralUseAudioBank:           { Blue: 5, Gray: 4, Red: 5, Orange: 5, Purple: 4, Black: 3, Red2: 5, CB23: 5, C110P: 6,  Yellow: 4, DarkBlue: 4, BUnit: 5, RUnit: 4, BBUnit: 5 },
