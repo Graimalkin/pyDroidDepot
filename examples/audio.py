@@ -12,13 +12,9 @@ This example code is licensed under the MIT license and is intended to demonstra
 use the droid package. It is not intended for production use.
 """
 
-import sys
-sys.path.insert(0, '../')
-
 from random import randrange
 from droiddepot.connection import discover_droid, DroidCommandId
 from droiddepot.script import DroidScripts
-from time import sleep
 from bleak import BleakError
 import asyncio
 
@@ -33,11 +29,11 @@ async def main() -> None:
             await d.audio_controller.set_volume(20)
 
             current_audio_index = 1
-            while d.droid.is_connected:
+            while d.is_connected:
                 print("Playing sound id %s from bank 1" % current_audio_index)
                 await d.audio_controller.play_audio(current_audio_index, 1, True)
                 
-                sleep(randrange(10, 30))
+                await asyncio.sleep(randrange(10, 30))
                 current_audio_index += 1
                 if current_audio_index > 5:
                     current_audio_index = 1

@@ -1,13 +1,9 @@
 """
 """
 
-import sys
-sys.path.insert(0, '../')
-
 from random import randrange
 from droiddepot.connection import discover_droid, DroidCommandId
 from droiddepot.script import DroidScripts
-from time import sleep
 from bleak import BleakError
 import asyncio
 
@@ -22,8 +18,8 @@ async def main() -> None:
             await d.audio_controller.set_volume(20)
             d.script_engine.start_beacon_reactions()
 
-            while d.droid.is_connected:
-                sleep(1)
+            while d.is_connected:
+                await asyncio.sleep(1)
             
     except OSError as err:
         print(f"Discovery failed due to operating system: {err}")

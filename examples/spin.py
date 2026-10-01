@@ -1,13 +1,9 @@
 """
 """
 
-import sys
-sys.path.insert(0, '../')
-
 from random import randrange
 from droiddepot.connection import discover_droid, DroidCommandId
 from droiddepot.motor import DroidMotorDirection, DroidMotorIdentifier
-from time import sleep
 from bleak import BleakError
 import asyncio
 
@@ -20,9 +16,9 @@ async def main() -> None:
     try:
         async with droid as d:
             current_direction = DroidMotorDirection.Forward
-            while d.droid.is_connected:
-                await d.motor_controller.send_motor_speed_command(current_direction, DroidMotorIdentifier.LeftMotor, 100, 300)
-                sleep(50)  
+            while d.is_connected:
+                await d.motor_controller.set_motor_speed(current_direction, DroidMotorIdentifier.LeftMotor, 100, 300)
+                await asyncio.sleep(5)  
                 if current_direction == DroidMotorDirection.Forward:
                     current_direction = DroidMotorDirection.Backwards
                 else:

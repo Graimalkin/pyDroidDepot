@@ -91,17 +91,38 @@ class DroidNotificationProcessor(object):
             An object representing the response to the given command, or None if no response is received within the specified timeout.
         """
 
-        # Queue our callback Queue for handling
-        callback_queue = asyncio.Queue()
-        if command_id not in self.__pending_callback_events:
-            self.__pending_callback_events[command_id] = []
-        self.__pending_callback_events[command_id].append(callback_queue)
+        return await self.wait_for_response(self.expect_response(command_id), timeout)
 
-        # Wait for our response from the droid
+    def expect_response(self, command_id: int) -> asyncio.Future:
+        """
+        Registers interest in the next response for a command id. Call this BEFORE sending the
+        request so a fast reply can't arrive before anyone is listening.
+
+        Returns:
+            A future to pass to wait_for_response.
+        """
+
+        future = asyncio.get_running_loop().create_future()
+        future.command_id = command_id
+        self.__pending_callback_events.setdefault(command_id, []).append(future)
+        return future
+
+    async def wait_for_response(self, future: asyncio.Future, timeout: float = 1.0) -> object:
+        """
+        Waits for a response registered with expect_response.
+
+        Returns:
+            The response, or None if nothing arrived within the timeout.
+        """
+
         try:
-            return await asyncio.wait_for(callback_queue.get(), timeout=timeout)
+            return await asyncio.wait_for(asyncio.shield(future), timeout=timeout)
         except asyncio.TimeoutError:
             return None
+        finally:
+            pending = self.__pending_callback_events.get(future.command_id, [])
+            if future in pending:
+                pending.remove(future)
 
     def decode_notify_message(self, data: bytearray) -> DroidNotifyMessage:
         """
@@ -122,7 +143,7 @@ class DroidNotificationProcessor(object):
         message_data = hex_data[8:]
 
         if len(data) != message_size:
-            raise ValueError('Received truncated packet. Expected %s, got %s' % (len(data), message_size))
+            raise ValueError('Received truncated packet. Expected %s, got %s' % (message_size, len(data)))
 
         return DroidNotifyMessage(message_size, unknown1, command_id, unknown3, message_data)
 
@@ -141,6 +162,9 @@ class DroidNotificationProcessor(object):
         except ValueError as e:
             logging.error('Failed to process notification message with data %s. Data is malformed' % (data.hex()))
             logging.error(e, exc_info=True)
+        except Exception as e:
+            # Never let a handler bug escape into bleak's notification callback.
+            logging.error('Unexpected error processing notification message with data %s' % (data.hex()), exc_info=True)
 
     async def __handle_pending_callbacks(self, message: DroidNotifyMessage, response: object) -> None:
         """
@@ -158,9 +182,9 @@ class DroidNotificationProcessor(object):
         if not len(self.__pending_callback_events[command_id]):
             return
         
-        first_callback_event = self.__pending_callback_events[command_id][0]
-        await first_callback_event.put(response)
-        self.__pending_callback_events[command_id].remove(first_callback_event)
+        first_callback_event = self.__pending_callback_events[command_id].pop(0)
+        if not first_callback_event.done():
+            first_callback_event.set_result(response)
 
     async def __process_incoming_message(self, message: DroidNotifyMessage) -> None:
         """
@@ -198,8 +222,9 @@ class DroidNotificationProcessor(object):
             Exception: If the firmware version received does not match the expected firmware version.
         """
 
+        # Raising here would escape into bleak's notification callback, so just warn.
         if message.message_data != DroidFirmwareVersion:
-            raise Exception('Possibly incomaptible droid detected. Possibly a new firmware version.')
+            logging.warning('Possibly incompatible droid detected. Possibly a new firmware version: %s' % message.message_data)
         
     async def __handle_runit_head_motor_events(self, message: DroidNotifyMessage) -> None:
         """

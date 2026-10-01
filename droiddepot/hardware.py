@@ -219,26 +219,26 @@ def get_available_audio_in_bank(bank_id: int, personality_id: int) -> int:
     if bank_id not in DroidPersonalityIdentifier.ChipAudioCount:
         return 0
     
-    bank_info = DroidPersonalityIdentifier.ChipAudioCount[personality_id]
-    return 0 if personality_id not in bank_info else bank_info[personality_id]
+    bank_info = DroidPersonalityIdentifier.ChipAudioCount[bank_id]
+    return bank_info.get(personality_id, 0)
 
-def get_shutdown_audio_track(affiliation_id: int) -> tuple:
+def get_shutdown_audio_track(personality_id: int) -> tuple:
     """
     Returns a tuple containing the audio bank and sounud id that should be played when the droid goes to sleep
-    based on its afilliation.
+    based on its personality.
 
     Args:
-        affiliation_id (int): The identnfier that represents the droid's affiliation
+        personality_id (int): The identifier that represents the droid's personality
 
     Returns:
         A tuple(bank_id, sound_id) containing the droid's shutdown audio information. If the information cannot be found the
         default is returned of (7, 1).
     """
 
-    if affiliation_id not in DroidPersonalityIdentifier.ChipShutdownTrack:
+    if personality_id not in DroidPersonalityIdentifier.ChipShutdownTrack:
         return (DroidAudioBankIdentifier.FirstOrderAudioBank, 1)
     
-    return DroidPersonalityIdentifier.ChipShutdownTrack[affiliation_id]
+    return DroidPersonalityIdentifier.ChipShutdownTrack[personality_id]
 
 def get_personality_affiliation(personality_id: int) -> int:
     """

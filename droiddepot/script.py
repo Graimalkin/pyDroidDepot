@@ -12,7 +12,6 @@ This module contains classes and functions for interacting with droid scripts.
 import asyncio
 import logging
 from datetime import datetime
-from dbeacon import scanner, beacon
 from droiddepot.protocol import DroidCommandId
 
 class DroidScripts(object):
@@ -30,9 +29,16 @@ class DroidScripts(object):
     DroidBayActivationSequence = 8
     UnknownBUnitScript9 = 9
     UnknownBUnitScript10 = 10
-    DroidPairingSequence1 = 11
-    DroidPairingSequence2 = 12
+    # Upstream formatted script ids as decimal digits inside a hex string ("{:02d}"), so ids
+    # 11 and 12 actually went out on the wire as 0x11 and 0x12. Those are the values the
+    # pairing sequence was observed working with, so they are kept as-is here now that ids
+    # are encoded as real hex. Verify on hardware before changing.
+    DroidPairingSequence1 = 0x11
+    DroidPairingSequence2 = 0x12
     FullThrottleTestScript = 13
+
+    # Never run these from automation: 13 drives the motors at full throttle.
+    DangerousScripts = (13, 0x13)
 
 class DroidScriptActions(object):
     """
@@ -59,8 +65,7 @@ class DroidScriptEngine(object):
         self.droid = droid
 
         self.__location_reaction_tracker = {}
-        self.reaction_scanner = scanner.DBeaconScanner()
-        self.reaction_scanner.add_beacon_handler(10, self.__perform_location_reactions)
+        self.reaction_scanner = None
 
     async def send_script_command(self, script_id: int, script_action: int) -> None:
         """
@@ -78,10 +83,10 @@ class DroidScriptEngine(object):
         if script_id <= 0 and script_action != DroidScriptActions.CloseScript:
             raise ValueError("Invalid script id requested. Script ids must be larger then 0")
 
-        if script_id == 13:
+        if script_id in DroidScripts.DangerousScripts:
             raise ValueError("Attempted to use a dangerous script. Execution denied")
 
-        command_data = "%s%s" % ("{:02d}".format(script_id), "{:02d}".format(script_action))
+        command_data = "%02x%02x" % (script_id, script_action)
         await self.droid.send_droid_command(DroidCommandId.ScriptActionComand, command_data)
 
     async def execute_script(self, script_id: int) -> None:
@@ -105,7 +110,7 @@ class DroidScriptEngine(object):
 
         return DroidScriptProgrammer(self.droid, script_id)
 
-    async def execute_location_beacon(self, beacon: beacon.LocationBeacon) -> None:
+    async def execute_location_beacon(self, beacon: object) -> None:
         """
         Executes a location beacon on the connected droid emulation what would happen
         if the droid encountered the beacon at a Disney park
@@ -187,7 +192,13 @@ class DroidScriptEngine(object):
     def start_beacon_reactions(self) -> None:
         """
         Enables SWGE park beacon reactions similar to the internal firmware.
+        Requires the optional "beacon" extra (pydBeacon).
         """
+
+        if self.reaction_scanner is None:
+            from dbeacon import scanner
+            self.reaction_scanner = scanner.DBeaconScanner()
+            self.reaction_scanner.add_beacon_handler(10, self.__perform_location_reactions)
 
         self.reaction_scanner.start()
 
@@ -195,6 +206,9 @@ class DroidScriptEngine(object):
         """
         Disables park beacon reactions.
         """
+
+        if self.reaction_scanner is None:
+            return
 
         self.reaction_scanner.stop()
 
@@ -226,7 +240,7 @@ class DroidScriptProgrammer(object):
         Opens the script for writing.
         """
 
-        await self.send_script_command(self.script_id, DroidScriptActions.OpenScript)
+        await self.droid.script_engine.send_script_command(self.script_id, DroidScriptActions.OpenScript)
 
     async def close_script(self, script_id: int = 0) -> None:
         """
@@ -234,14 +248,14 @@ class DroidScriptProgrammer(object):
         being executed.
         """
 
-        await self.send_script_command(self.script_id, DroidScriptActions.CloseScript)
+        await self.droid.script_engine.send_script_command(self.script_id, DroidScriptActions.CloseScript)
 
     async def __aenter__(self) -> object:
         """
         Opens the script for writing.
         """
 
-        await self.open_script(self.script_id)
+        await self.open_script()
         return self
     
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
@@ -249,4 +263,4 @@ class DroidScriptProgrammer(object):
         Closes the script.
         """
 
-        await self.close_script(self.script_id)
+        await self.close_script()
