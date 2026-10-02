@@ -1,12 +1,8 @@
 """
 """
 
-import sys
-sys.path.insert(0, '../')
-
 from droiddepot.connection import discover_droid, DroidCommandId
 from droiddepot.audio import DroidLedIdentifier
-from time import sleep
 from bleak import BleakError
 import asyncio
 import inspect
@@ -57,8 +53,8 @@ async def main() -> None:
         try:
             await d.motor_controller.center_head()
 
-            while d.droid.is_connected:            
-                command = input("Command:")
+            while d.is_connected:            
+                command = await asyncio.to_thread(input, "Command:")
                 command_parts = command.split(',')
                 if len(command_parts) < 2:
                     print('Invalid arguments supplied. <service_component>,<method_name>,<..args>')

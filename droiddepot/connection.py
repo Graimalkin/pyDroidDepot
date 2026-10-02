@@ -2,19 +2,23 @@
 Copyright (c) Jordan Maxwell, All Rights Reserved.
 See LICENSE file in the project root for full license information.
 
-DroidConnection is a BLE class representing a connection to a SWGE DroidDepot droid. 
+DroidConnection is a BLE class representing a connection to a SWGE DroidDepot droid.
 It includes methods for connecting, disconnecting, sending commands, and running scripts on the droid.
 
-It also includes instances of DroidAudioController, DroidMotorController, and DroidScriptEngine 
+It also includes instances of DroidAudioController, DroidMotorController, and DroidScriptEngine
 to manage the droid's audio, motor, and script functions.
+
+Everything in this module runs on a single asyncio event loop. Writes to the droid are
+serialized with a lock so concurrent callers (heartbeat, automations, scripts) can never
+interleave GATT writes.
 """
 
 import asyncio
 from contextlib import AbstractAsyncContextManager
 import logging
-from time import sleep
-from threading import Thread
+from typing import Callable, Optional, Union
 from bleak import BleakScanner, BleakClient
+from bleak.backends.device import BLEDevice
 from droiddepot.protocol import *
 from droiddepot.audio import DroidAudioController
 from droiddepot.motor import DroidMotorController
@@ -23,41 +27,102 @@ from droiddepot.voice import DroidVoiceController
 from droiddepot.notify import DroidNotificationProcessor
 from droiddepot.hardware import DroidPersonalityIdentifier, DroidAffiliation
 
+logger = logging.getLogger(__name__)
+
+# The droid drops idle connections, so we poke it with a harmless command on this interval.
+HEARTBEAT_INTERVAL = 10.0
+
+# Upper bound for a single GATT write. BlueZ can wedge a write forever when the link degrades.
+WRITE_TIMEOUT = 5.0
+
+def build_droid_command(command_id: int, data: str = "") -> bytearray:
+    """
+    Creates the bytearray for a droid command.
+
+    The first byte is the total length of the command (header + data) or'ed with 0x20. The second byte is 0x42
+    for multipurpose commands (id 15), or 0x00 otherwise. The third byte is the command id itself. The fourth
+    byte is the length of the data plus 0x40. The remaining bytes are the data itself.
+
+    Args:
+        command_id (int): The command id to be included in the Droid command
+        data (str): The data to be included in the Droid command as a hex string
+
+    Returns:
+        bytearray: The packed command
+
+    Raises:
+        ValueError: If the data string is not valid hex
+    """
+
+    try:
+        payload = bytes.fromhex(data)
+    except ValueError:
+        raise ValueError("Failed to pack droid command (%s) with data (%s). Data is malformed" % (command_id, data))
+
+    header_length = 3
+    byte1 = (len(payload) + header_length) | 0x20
+    byte2 = 0x42 if command_id == DroidCommandId.MultipurposeCommand else 0x00
+    byte3 = command_id
+    byte4 = len(payload) + 0x40
+
+    command_bytes = bytearray([byte1, byte2, byte3, byte4])
+    command_bytes.extend(payload)
+    return command_bytes
+
+def build_droid_multi_command(command_id: int, data: str = "") -> bytearray:
+    """
+    Creates the bytearray for a multipurpose droid command (command 15 with a 0x44 sub-header).
+
+    Args:
+        command_id (int): The multipurpose command id (see DroidMultipurposeCommand)
+        data (str): The data to be included in the command as a hex string
+    """
+
+    return build_droid_command(DroidCommandId.MultipurposeCommand, "44%02x%s" % (command_id, data))
+
+def parse_manufacturer_data(manufacturer_data: Optional[dict]) -> tuple:
+    """
+    Extracts the (personality_id, affiliation_id) from a droid's advertisement manufacturer data.
+    Falls back to an R unit scoundrel when the data is missing.
+    """
+
+    if not manufacturer_data or DisneyBLEManufacturerId.DroidManufacturerId not in manufacturer_data:
+        return (DroidPersonalityIdentifier.RUnit, DroidAffiliation.Scoundrel)
+
+    droid_data = manufacturer_data[DisneyBLEManufacturerId.DroidManufacturerId]
+    if len(droid_data) < 2:
+        return (DroidPersonalityIdentifier.RUnit, DroidAffiliation.Scoundrel)
+
+    personality_id = droid_data[-1]
+    affiliation_id = (droid_data[-2] - 0x80) // 2
+    return (personality_id, affiliation_id)
+
 class DroidConnection(AbstractAsyncContextManager):
     """
     Represents a connection to a SWGE DroidDepot droid.
 
     Args:
-        profile (str): A string representing the UUID of the BLE profile to connect to.
-        manufacturer_data (dict): A dictionary containing the manufacturer data of the droid being connected.
+        profile (BLEDevice | str): The BLE device (preferred) or MAC address of the droid.
+        manufacturer_data (dict): The manufacturer data from the droid's advertisement, if known.
+        disconnected_callback (callable): Optional callback invoked with this connection when the link drops.
+        client_factory (callable): Builds the BLE client. Overridable for tests.
     """
 
     DroidServiceId = '09b600a0-3e42-41fc-b474-e9c0c8f0c801'
 
-    def __init__(self, profile: str, manufacturer_data):
+    def __init__(self, profile: Union[BLEDevice, str], manufacturer_data: Optional[dict] = None,
+                 disconnected_callback: Optional[Callable[["DroidConnection"], None]] = None,
+                 client_factory: Callable[..., BleakClient] = BleakClient):
         """
-        Initializes a new instance of the Droid class.
-
-        Args:
-            profile (str): A string representing the UUID of the BLE profile to connect to.
-            manufacturer_data (dict): A dictionary containing the manufacturer data of the droid being connected.
-
-        Attributes:
-            droid: A BLE connection object for the droid.
-            personality_id: The personality ID of the droid. Default is DroidPersonalityIdentifier.RUnit.
-            affiliation_id: The affiliation ID of the droid. Default is DroidAffiliation.Scoundrel.
-            audio_controller: An instance of the DroidAudioController class.
-            script_engine: An instance of the DroidScriptEngine class.
-            motor_controller: An instance of the DroidMotorController class.
-            heartbeat_loop: An asyncio event loop used for the heartbeat thread.
-            heartbeat_thread: A thread that runs the heartbeat_loop.
+        Initializes a new instance of the DroidConnection class.
         """
-        
+
         self.profile = profile
         self.droid = None
         self.manufacturer_data = manufacturer_data
-        self.personality_id = DroidPersonalityIdentifier.RUnit
-        self.affiliation_id = DroidAffiliation.Scoundrel
+        self.personality_id, self.affiliation_id = parse_manufacturer_data(manufacturer_data)
+        self.disconnected_callback = disconnected_callback
+        self.client_factory = client_factory
 
         self.audio_controller = DroidAudioController(self)
         self.script_engine = DroidScriptEngine(self)
@@ -65,40 +130,50 @@ class DroidConnection(AbstractAsyncContextManager):
         self.voice_controller = DroidVoiceController(self)
         self.notify_processor = DroidNotificationProcessor(self)
 
-        self.heartbeat_loop = asyncio.new_event_loop()
-        self.heartbeat_thread = None
+        self._write_lock = asyncio.Lock()
+        self._heartbeat_task: Optional[asyncio.Task] = None
 
-    async def connect(self, silent: bool = False) -> None:
+    @property
+    def address(self) -> str:
+        """
+        The MAC address (or platform identifier) of the droid.
+        """
+
+        return self.profile.address if isinstance(self.profile, BLEDevice) else str(self.profile)
+
+    @property
+    def is_connected(self) -> bool:
+        """
+        True when the BLE link to the droid is up.
+        """
+
+        return self.droid is not None and self.droid.is_connected
+
+    async def connect(self, silent: bool = False, timeout: float = 20.0) -> None:
         """
         Connect to the Droid using BLE.
+
+        Args:
+            silent (bool): Skip the pairing animation/chirp the droid plays on connect.
+            timeout (float): Seconds to wait for the BLE connection to establish.
         """
 
-        timeout = 0.0
-        self.droid = BleakClient(self.profile)
+        self.droid = self.client_factory(self.profile, disconnected_callback=self._on_disconnected, timeout=timeout)
         await self.droid.connect()
         await self.droid.start_notify(DroidBluetoothCharacteristics.DroidNotifyCharacteristic, self.notification_handler)
 
-        while not self.droid.is_connected and timeout < 10:
-            sleep (.1)
-            timeout += .1
-
+        # The droid ignores commands until it sees this "login" value. Sending it twice matches
+        # the official app; it also turns off the droid's own beacon until we disconnect.
         connect_code = bytearray.fromhex("222001")
-        await self.droid.write_gatt_char(0x000d, connect_code, False)
-        await self.droid.write_gatt_char(0x000d, connect_code, False)
+        for _ in range(2):
+            await self.write(connect_code)
+            await asyncio.sleep(0.1)
 
-        droid_data = self.manufacturer_data[DisneyBLEManufacturerId.DroidManufacturerId]
-
-        droid_data_len = len(droid_data)
-        self.personality_id = droid_data[droid_data_len - 1]
-        self.affiliation_id = (droid_data[droid_data_len - 2] - 0x80) / 2
-        
         if not silent:
             await self.script_engine.execute_script(DroidScripts.DroidPairingSequence1)
-            sleep(4)
+            await asyncio.sleep(4)
 
-        self.heartbeat_thread = Thread(target=self.__start_heartbeat_loop, args=(self.heartbeat_loop,), daemon=True)
-        self.heartbeat_thread.start()
-        asyncio.run_coroutine_threadsafe(self.__send_heartbeat_command(), self.heartbeat_loop)
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
 
     async def __aenter__(self) -> object:
         """
@@ -116,44 +191,60 @@ class DroidConnection(AbstractAsyncContextManager):
 
         await self.notify_processor.handle_incoming_message(sender, data)
 
-    def __start_heartbeat_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _on_disconnected(self, client: BleakClient) -> None:
         """
-        Starts the heartbeat event loop
-        """
-
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-    async def __send_heartbeat_command(self) -> None:
-        """
-        Sends a harmless unused command every 10 seconds to keep our connection to the droid alive even when not in use.
+        Called by bleak when the link drops, whether we asked for it or not.
         """
 
-        while self.droid.is_connected:
-            await self.send_droid_command(DroidCommandId.ConnectionHeartbeat)
-            sleep(10)
+        logger.info("Droid %s disconnected", self.address)
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
+
+        if self.disconnected_callback is not None:
+            self.disconnected_callback(self)
+
+    async def _heartbeat_loop(self) -> None:
+        """
+        Sends a harmless unused command periodically to keep the connection alive even when not in use.
+        """
+
+        try:
+            while self.is_connected:
+                await asyncio.sleep(HEARTBEAT_INTERVAL)
+                if not self.is_connected:
+                    break
+                await self.send_droid_command(DroidCommandId.ConnectionHeartbeat)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            # A failed heartbeat means the link is dying; bleak's disconnect callback handles the rest.
+            logger.warning("Heartbeat to droid %s failed: %s", self.address, err)
 
     async def disconnect(self, silent: bool = False) -> None:
         """
         Disconnect from the Droid.
+
+        Args:
+            silent (bool): Skip the shutdown sound.
         """
 
-        if not self.droid.is_connected:
-            return
-        
-        # Perform shutdown operations
-        await self.motor_controller.set_head_speed(0, 0)
-        await self.motor_controller.set_drive_speed(0, 0)
+        if self._heartbeat_task is not None:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
-        logging.info("Disconnecting from droiddepot")
+        if not self.is_connected:
+            return
+
+        logger.info("Disconnecting from droid %s", self.address)
         try:
+            await self.motor_controller.stop_all_motors()
             if not silent:
                 await self.audio_controller.play_shutdown_audio()
+        except Exception as err:
+            logger.warning("Shutdown commands to droid %s failed: %s", self.address, err)
         finally:
             await self.droid.disconnect()
-
-            if self.heartbeat_loop != None:
-                self.heartbeat_loop.stop()
 
     async def __aexit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
         """
@@ -162,45 +253,26 @@ class DroidConnection(AbstractAsyncContextManager):
 
         await self.disconnect()
 
+    async def write(self, payload: bytearray) -> None:
+        """
+        Writes raw bytes to the droid's command characteristic. Writes are serialized and time limited.
+        """
+
+        if self.droid is None:
+            raise ConnectionError("Droid %s is not connected" % self.address)
+
+        async with self._write_lock:
+            logger.debug('Sending command: %s', payload.hex())
+            await asyncio.wait_for(
+                self.droid.write_gatt_char(DroidBluetoothCharacteristics.DroidCommandCharacteristic, payload, response=False),
+                timeout=WRITE_TIMEOUT)
+
     def build_droid_command(self, command_id: int, data: str) -> bytearray:
         """
-        The build_droid_command function creates a bytearray that represents a command for a Droid. 
-        It takes in a command_id (integer) and a data string, and returns the corresponding bytearray.
-
-        The first byte of the bytearray represents the total length of the command in bytes. The second byte is 0x42 
-        if the command id is 15, or 0x00 otherwise. The third byte is the command id itself. The fourth byte is the length 
-        of the data string in bytes, plus 0x40. The remaining bytes are the data string itself, represented in hexadecimal format.
-
-        If the data string is malformed, a ValueError is raised.
-
-        Args:
-            command_id (int): The command id to be included in the Droid command
-            data (str): The data string to be included in the Droid command
-
-        Returns:
-            bytearray: The bytearray representation of the Droid command, with the given command id and data string.
+        Kept for API compatibility. See the module level build_droid_command.
         """
 
-        data_length = len(data) // 2
-        header_length = 3
-
-        if command_id == 15:
-            byte2 = 0x42
-        else:
-            byte2 = 0x00
-
-        total_length = data_length + header_length
-        byte1 = total_length | 0x20
-        byte3 = command_id
-        byte4 = data_length + 0x40
-
-        try:
-            command_bytes = bytearray([byte1, byte2, byte3, byte4])
-            command_bytes.extend(bytes.fromhex(data))
-        except ValueError:
-            raise ValueError("Failed to pack droid command (%s) with data (%s). Data is malformed" % (command_id, data))
-        
-        return command_bytes
+        return build_droid_command(command_id, data)
 
     async def send_droid_command(self, command_id: int, data: str = "") -> None:
         """
@@ -213,9 +285,7 @@ class DroidConnection(AbstractAsyncContextManager):
             data (str): Optional data to include in the command, as a string of hexadecimal digits.
         """
 
-        command = self.build_droid_command(command_id, data)
-        logging.debug('Sending command: %s' % command.hex())
-        await self.droid.write_gatt_char(DroidBluetoothCharacteristics.DroidCommandCharacteristic, bytearray.fromhex(command.hex()))
+        await self.write(build_droid_command(command_id, data))
 
     async def send_droid_multi_command(self, command_id: int, data: str = "") -> None:
         """
@@ -228,21 +298,21 @@ class DroidConnection(AbstractAsyncContextManager):
             data (str): Optional data to include in the command, as a string of hexadecimal digits.
         """
 
-        command = "44%s%s" % ("{:02d}".format(command_id), data)
-        await self.send_droid_command(DroidCommandId.MultipurposeCommand, command)
+        await self.write(build_droid_multi_command(command_id, data))
 
-    async def get_droid_firmware_information(self) -> None:
+    async def get_droid_firmware_information(self) -> str:
         """
         Requests the droid firmware information. Currently the contents of this data
-        is unknown. Because of this this request only returns the raw data processed by the 
+        is unknown. Because of this this request only returns the raw data processed by the
         notify command processor.
         """
 
+        response = self.notify_processor.expect_response(DroidCommandId.RetrieveFirmwareInformationResponse)
         await self.send_droid_command(DroidCommandId.RetrieveFirmwareInformation)
-        firemware_information = await self.notify_processor.wait_for_command_response(DroidCommandId.RetrieveFirmwareInformationResponse)
-        if firemware_information == None:
-            raise Exception('Failed to retrieve firmware information. No response given')
-        return firemware_information
+        firmware_information = await self.notify_processor.wait_for_response(response)
+        if firmware_information is None:
+            raise TimeoutError('Failed to retrieve firmware information. No response given')
+        return firmware_information
 
     async def set_pairing_led(self, state: bool) -> None:
         """
@@ -271,73 +341,88 @@ class DroidConnection(AbstractAsyncContextManager):
 
     async def flash_pairing_led(self, data: str) -> None:
         """
-        Flashes the droids onboard pairing led. Currently the data required for this command has not been decoded. 
+        Flashes the droids onboard pairing led. Currently the data required for this command has not been decoded.
 
-        An example piece of encoded data is "020001ff01ff0aff00". This hex encoded string will flash the pairing LED 10 times at 
+        An example piece of encoded data is "020001ff01ff0aff00". This hex encoded string will flash the pairing LED 10 times at
         a rate of once per second.
         """
 
         await self.send_droid_command(DroidCommandId.FlashPairingLed, data)
 
-async def discover_droids(retry: bool = False) -> list:
+def is_droid_advertisement(ble_device: BLEDevice, advertising_data: object) -> bool:
     """
-    Scans for nearby Bluetooth devices manufactured by Disney and have the device name of "DROID" if any are found they will be
-    converted to a DroidConnection and added to a list to return. If retry is False, the function will out after a set
-    period of time and return without discovering any droids.
+    True when an advertisement comes from a Droid Depot droid.
+    """
+
+    manufacturer_data = advertising_data.manufacturer_data or {}
+    name = advertising_data.local_name or ble_device.name
+    return name == "DROID" and DisneyBLEManufacturerId.DroidManufacturerId in manufacturer_data
+
+async def discover_droids(retry: bool = False, timeout: float = 10.0) -> list:
+    """
+    Scans for nearby Bluetooth devices manufactured by Disney with the device name of "DROID" and returns
+    a DroidConnection for each one.
 
     Args:
-        retry (bool): whether or not to continue scanning until a device is found or the function is interrupted
+        retry (bool): Keep scanning until at least one droid is found or the task is cancelled.
+        timeout (float): Seconds per scan window.
 
     Returns:
-        a list of DroidConnection objects representing the discovered "DROID" Bluetooth devices if any. Otherwise an empty list
+        a list of DroidConnection objects for the discovered droids. Empty when none were found and retry is False.
     """
 
-    async with BleakScanner() as scanner:      
-        droid_connections = []
-        droids = []
-        
-        while True:
-            possible_droids = scanner.discovered_devices_and_advertisement_data
-            if len(possible_droids) == 0:
-                await asyncio.sleep(5)
-                continue
+    while True:
+        discovered = await BleakScanner.discover(timeout=timeout, return_adv=True)
+        droid_connections = [
+            DroidConnection(ble_device, advertising_data.manufacturer_data)
+            for ble_device, advertising_data in discovered.values()
+            if is_droid_advertisement(ble_device, advertising_data)]
 
-            for possible_droid_address in possible_droids:
-                ble_device, advertising_data = possible_droids[possible_droid_address]
-                manufacturer_ids = list(advertising_data.manufacturer_data.keys()) if advertising_data.manufacturer_data != None else []
+        for droid in droid_connections:
+            logger.info("Droid discovered: %s (personality %s)", droid.address, droid.personality_id)
 
-                if ble_device.name == "DROID" and DisneyBLEManufacturerId.DroidManufacturerId in manufacturer_ids:
-                    droids.append((ble_device, advertising_data.manufacturer_data))
-                    
-            if len(droids) == 0:
-                if not retry:
-                    logging.error("Droid discovery failed. Retrying...")
-                    await asyncio.sleep(5)
-                    continue
-                else:
-                    logging.warning("Droid discovery failed. Retrying...")
-                    await asyncio.sleep(5)
-                    continue
-            else:
-                for discovered_droid in droids:
-                    logging.info(f"Droid successfully discovered: [ {discovered_droid[0]} ]")
-                    droid_connections.append(DroidConnection(*discovered_droid))
-                break
-    
-    return droid_connections
+        if droid_connections or not retry:
+            return droid_connections
 
-async def discover_droid(retry: bool = False) -> DroidConnection:
+        logger.warning("Droid discovery found nothing. Retrying...")
+
+async def discover_droid(retry: bool = False, timeout: float = 10.0) -> Optional[DroidConnection]:
     """
-    Scans for nearby Bluetooth devices manufactured by Disney and have the device name of "DROID" and returns if found. If retry is True, the function will
-    continue scanning until it finds a device or is interrupted. If retry is False, the function will time out after a
-    set period of time and return without discovering a device.
+    Scans for nearby droids and returns the first one found.
 
     Args:
-        retry (bool): whether or not to continue scanning until a device is found or the function is interrupted
+        retry (bool): Keep scanning until a droid is found or the task is cancelled.
+        timeout (float): Seconds per scan window.
 
     Returns:
-        a DroidConnection object representing the discovered "DROID" Bluetooth device if any. Otherwise None
+        a DroidConnection for the first droid found, otherwise None
     """
 
-    discovered_droids = await discover_droids(retry)
-    return None if len(discovered_droids) == 0 else discovered_droids[0]
+    discovered_droids = await discover_droids(retry, timeout)
+    return discovered_droids[0] if discovered_droids else None
+
+async def find_droid(address: str, timeout: float = 15.0, **kwargs) -> Optional[DroidConnection]:
+    """
+    Scans for one specific droid by MAC address. Use this when more than one droid is in range.
+
+    Args:
+        address (str): The droid's MAC address (case insensitive).
+        timeout (float): Seconds to scan before giving up.
+        kwargs: Passed through to DroidConnection (e.g. disconnected_callback).
+
+    Returns:
+        a DroidConnection for the droid, or None if it was not seen advertising. A droid that is
+        already connected to something else (e.g. the Disney app) does not advertise.
+    """
+
+    found = {}
+    def match(ble_device: BLEDevice, advertising_data: object) -> bool:
+        if ble_device.address.upper() != address.upper() or not is_droid_advertisement(ble_device, advertising_data):
+            return False
+        found['manufacturer_data'] = advertising_data.manufacturer_data
+        return True
+
+    ble_device = await BleakScanner.find_device_by_filter(match, timeout=timeout)
+    if ble_device is None:
+        return None
+    return DroidConnection(ble_device, found.get('manufacturer_data'), **kwargs)

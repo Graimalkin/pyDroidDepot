@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyDroidDepot"
+version = "2.0.0"
+description = "Module for controlling droids built and purchased at the Droid Depot in Disney's Galaxys Edge"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Jordan Maxwell" }]
+requires-python = ">=3.10"
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = ["bleak>=1.0,<4"]
+
+[project.optional-dependencies]
+beacon = ["pydBeacon==1.0.0"]
+test = ["pytest>=8", "pytest-asyncio>=0.23"]
+
+[project.urls]
+Homepage = "https://github.com/Graimalkin/pyDroidDepot"
+Upstream = "https://github.com/thetestgame/pyDroidDepot"
+
+[tool.setuptools]
+packages = ["droiddepot"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

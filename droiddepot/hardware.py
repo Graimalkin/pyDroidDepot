@@ -60,7 +60,7 @@ class DroidPersonalityIdentifier(object):
 
         C110P (int): Identifier for the C1-10P droid.
         CB23 (int): Identifier for the CB-23 droid.
-        BUnit (int): Identifier for the BD unit droid.
+        BDUnit (int): Identifier for the BD unit droid (BUnit is an alias).
         RUnit (int): Identifier for the R unit droid.
         BBUnit (int): Identifier for the BB unit droid.
 
@@ -79,12 +79,16 @@ class DroidPersonalityIdentifier(object):
     DarkBlue = 13
 
     # Droids
-    BUnit = 1
-    RUnit = 2
+    # Droid ids as broadcast in the last byte of the advertisement. Upstream had 1/2/14 assigned to
+    # the wrong droids; these match Droid-Toolbox's table and a real R-series droid (reports 0x01).
+    # The per-droid table rows below were already labelled correctly, so only the numbers changed.
+    RUnit = 1
+    BBUnit = 2
     CB23 = 9
     C110P = 11
     DO = 12
-    BBUnit = 14  
+    BDUnit = 14
+    BUnit = BDUnit  # upstream name for the BD unit, kept for compatibility
 
     ChipAudioCount = {
         DroidAudioBankIdentifier.GeneralUseAudioBank:           { Blue: 5, Gray: 4, Red: 5, Orange: 5, Purple: 4, Black: 3, Red2: 5, CB23: 5, C110P: 6,  Yellow: 4, DarkBlue: 4, BUnit: 5, RUnit: 4, BBUnit: 5 },
@@ -219,26 +223,26 @@ def get_available_audio_in_bank(bank_id: int, personality_id: int) -> int:
     if bank_id not in DroidPersonalityIdentifier.ChipAudioCount:
         return 0
     
-    bank_info = DroidPersonalityIdentifier.ChipAudioCount[personality_id]
-    return 0 if personality_id not in bank_info else bank_info[personality_id]
+    bank_info = DroidPersonalityIdentifier.ChipAudioCount[bank_id]
+    return bank_info.get(personality_id, 0)
 
-def get_shutdown_audio_track(affiliation_id: int) -> tuple:
+def get_shutdown_audio_track(personality_id: int) -> tuple:
     """
     Returns a tuple containing the audio bank and sounud id that should be played when the droid goes to sleep
-    based on its afilliation.
+    based on its personality.
 
     Args:
-        affiliation_id (int): The identnfier that represents the droid's affiliation
+        personality_id (int): The identifier that represents the droid's personality
 
     Returns:
         A tuple(bank_id, sound_id) containing the droid's shutdown audio information. If the information cannot be found the
         default is returned of (7, 1).
     """
 
-    if affiliation_id not in DroidPersonalityIdentifier.ChipShutdownTrack:
+    if personality_id not in DroidPersonalityIdentifier.ChipShutdownTrack:
         return (DroidAudioBankIdentifier.FirstOrderAudioBank, 1)
     
-    return DroidPersonalityIdentifier.ChipShutdownTrack[affiliation_id]
+    return DroidPersonalityIdentifier.ChipShutdownTrack[personality_id]
 
 def get_personality_affiliation(personality_id: int) -> int:
     """

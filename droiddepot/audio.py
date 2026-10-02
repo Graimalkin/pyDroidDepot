@@ -9,9 +9,11 @@ This module defines classes for controlling audio and LEDs for a droid. It conta
 """
 
 from enum import IntEnum
-from droiddepot.utils import  int_to_hex
 from droiddepot.protocol import DroidMultipurposeCommand, DroidAffiliation
 from droiddepot.hardware import DroidLedIdentifier, get_shutdown_audio_track
+
+# Volume is a 5 bit value on the droid (confirmed by Droid-Toolbox).
+MaxVolume = 0x1f
 
 class DroidAudioCommand(IntEnum):
     """
@@ -106,53 +108,49 @@ class DroidAudioController(object):
 
         Args:
             command_id (int): The ID of the audio command to execute.
-            data (str): The data to send with the audio command, if any.
+            data (str): The data to send with the audio command as a hex string, if any.
 
         Returns:
             None
         """
 
-        command_id = int_to_hex(command_id)
-        command_data = "%s%s"  % (command_id, data)
+        command_data = "%02x%s" % (command_id, data)
         await self.droid.send_droid_multi_command(DroidMultipurposeCommand.AudioControllerCommand, command_data)
 
     async def play_audio(self, sound_id: int = None, bank_id: int = None, cycle: bool = False, volume: int = None) -> None:
         """
-        Plays audio on the Droid.
+        Plays audio on the Droid. Bank and sound ids are 1-based.
+
+        - sound_id given: plays that sound from bank_id (or the currently selected bank).
+        - cycle: plays the next sound in bank_id (or the currently selected bank).
+        - otherwise: lets the droid pick a sound from bank_id (default bank 1).
 
         Args:
-            sound_id (int): The ID of the sound to play. Defaults to 0 if not provided.
-            bank_id (int): The ID of the audio bank to use. Defaults to 0 if not provided.
+            sound_id (int): The 1-based ID of the sound to play.
+            bank_id (int): The 1-based ID of the audio bank to use.
             cycle (bool): If True, cycles through the audio files in the selected audio bank. Defaults to False.
-            volume (int): The volume to play the audio at, in the range [0, 100]. If not provided, the Droid's current volume is used.
+            volume (int): The volume to play the audio at, 0-31. If not provided, the Droid's current volume is used.
 
         Returns:
             None
         """
 
-        if volume:
+        if volume is not None:
             await self.set_volume(volume)
 
-        bank_id = bank_id - 1 if bank_id != None else 0
-        if bank_id and (not hasattr(self, "sound_bank") or self.sound_bank != bank_id):
-            await self.set_audio_bank(bank_id)
+        if sound_id is not None or cycle:
+            # The bank selection lives on the droid and is lost on reconnect, so always send it when asked.
+            if bank_id is not None:
+                await self.set_audio_bank(bank_id - 1)
 
-        sound_id = int_to_hex(sound_id - 1 if sound_id != None else 0)
-        bank_id = int_to_hex(bank_id)
+            if sound_id is not None:
+                await self.execute_audio_command(DroidAudioCommand.PlayAudioFromSelectedGroup, "%02x" % (sound_id - 1))
+            else:
+                await self.execute_audio_command(DroidAudioCommand.CycleAudioFromSelectedGroup, "")
+            return
 
-        audio_command = "00"
-        audio_parameter = "00"
-
-        if sound_id:
-            audio_command = DroidAudioCommand.PlayAudioFromSelectedGroup
-            audio_parameter = sound_id
-        elif cycle:
-            audio_command = DroidAudioCommand.CycleAudioFromSelectedGroup
-        else:
-            audio_command = DroidAudioCommand.PlayAudioFromGroupByValue
-            audio_parameter = bank_id
-        
-        await self.execute_audio_command(audio_command, audio_parameter)
+        group = (bank_id - 1) if bank_id is not None else 0
+        await self.execute_audio_command(DroidAudioCommand.PlayAudioFromGroupByValue, "%02x" % group)
 
     async def play_shutdown_audio(self) -> None:
         """
@@ -160,31 +158,29 @@ class DroidAudioController(object):
         """
 
         bank_id, sound_id = get_shutdown_audio_track(self.droid.personality_id)
-        await self.play_audio(sound_id=sound_id, bank_id=bank_id, cycle=True)
+        await self.play_audio(sound_id=sound_id, bank_id=bank_id)
 
     async def set_audio_bank(self, bank_id: int) -> None:
         """
         Sets the selected audio bank on the Droid.
 
         Args:
-            bank_id (int): The ID of the audio bank to select.
+            bank_id (int): The 0-based ID of the audio bank to select.
         """
 
-        bank_id = int_to_hex(bank_id if bank_id != None else 0)
-        self.sound_bank = bank_id
-
-        await self.execute_audio_command(DroidAudioCommand.SetSelectedSoundBank, bank_id)
+        self.sound_bank = bank_id if bank_id is not None else 0
+        await self.execute_audio_command(DroidAudioCommand.SetSelectedSoundBank, "%02x" % self.sound_bank)
 
     async def set_volume(self, volume_level: int) -> None:
         """
         Sets the volume of the audio playback on the Droid.
 
         Args:
-            volume_level (int): The volume level to set.
+            volume_level (int): The volume level to set, 0 (mute) to 31 (max). Values outside the range are clamped.
         """
 
-        volume_level = int_to_hex(volume_level if volume_level != None else 0)
-        await self.execute_audio_command(DroidAudioCommand.SetVolume, volume_level)
+        volume_level = max(0, min(MaxVolume, volume_level if volume_level is not None else 0))
+        await self.execute_audio_command(DroidAudioCommand.SetVolume, "%02x" % volume_level)
 
     async def reset_head_leds(self) -> None:
         """
@@ -196,7 +192,7 @@ class DroidAudioController(object):
         """
         """
 
-        await self.execute_audio_command(DroidAudioCommand.DisableHeadLeds, led_identifier)
+        await self.execute_audio_command(DroidAudioCommand.DisableHeadLeds, "%02x" % led_identifier)
 
         if led_identifier not in self.disabled_leds:
             self.disabled_leds.append(led_identifier)
@@ -205,8 +201,7 @@ class DroidAudioController(object):
         """
         """
 
-        led_identifier = int_to_hex(led_identifier)
-        await self.execute_audio_command(DroidAudioCommand.EnableHeadLeds, led_identifier)
+        await self.execute_audio_command(DroidAudioCommand.EnableHeadLeds, "%02x" % led_identifier)
 
         if led_identifier in self.disabled_leds:
             self.disabled_leds.remove(led_identifier)
@@ -215,8 +210,7 @@ class DroidAudioController(object):
         """
         """
 
-        led_identifier = int_to_hex(led_identifier)
-        await self.execute_audio_command(DroidAudioCommand.SetLedOn, led_identifier)
+        await self.execute_audio_command(DroidAudioCommand.SetLedOn, "%02x" % led_identifier)
 
         if not led_identifier in self.turned_on_leds:
             self.turned_on_leds.append(led_identifier)
@@ -225,8 +219,7 @@ class DroidAudioController(object):
         """
         """
 
-        led_identifier = int_to_hex(led_identifier)
-        await self.execute_audio_command(DroidAudioCommand.SetLedOff, led_identifier)
+        await self.execute_audio_command(DroidAudioCommand.SetLedOff, "%02x" % led_identifier)
 
         if led_identifier in self.turned_on_leds:
             self.turned_on_leds.remove(led_identifier)

@@ -80,12 +80,19 @@ class DroidMotorController(object):
         
     async def stop_all_motors(self) -> None:
         """
-        Stops all motors. 
+        Stops all motors, the head included.
+
+        A speed of 0 only stops a motor running in the direction it was sent with: a forward
+        zero leaves a wheel that is running backwards still spinning (seen on a real R2, which
+        kept driving after a reverse pulse ended with a forward-zero). So every motor gets a
+        zero in both directions, with no ramp.
         """
 
-        motors = [e.value for e in DroidMotorIdentifier]
-        for motor in motors:
-            await self.set_motor_speed(DroidMotorDirection.Left, motor, 0)
+        for motor in DroidMotorIdentifier:
+            for direction in (DroidMotorDirection.Forward, DroidMotorDirection.Backwards):
+                await self.set_motor_speed(direction, motor.value, 0, 0)
+        for direction in (DroidMotorDirection.Forward, DroidMotorDirection.Backwards):
+            await self.set_head_speed(direction, 0, 0)
     
     async def set_motor_speed(self, direction: int, motor_id: int, speed: int = 160, ramp_speed: int = 300, delay = 0) -> None:
         """
@@ -126,13 +133,18 @@ class DroidMotorController(object):
         Sends a motor speed command to the droid to rotate in place.
 
         Args:
-            direction (int): An integer representing the motor direction. Should be one of the values defined in the DroidMotorDirection class.
+            direction (int): DroidMotorDirection.Left turns the droid to its own left (counter-clockwise
+                seen from above), DroidMotorDirection.Right to its own right (clockwise).
             speed (int): An integer representing the motor speed. Defaults to 160.
             ramp_speed (int): An integer representing the motor ramp speed. Defaults to 300.
         """
 
-        await self.set_motor_speed(direction, DroidMotorIdentifier.LeftMotor, speed, ramp_speed)
-        await self.set_motor_speed(DroidMotorDirection.Left if direction == DroidMotorDirection.Right else DroidMotorDirection.Right, DroidMotorIdentifier.RightMotor, speed, ramp_speed)
+        # Upstream drove the left wheel in `direction` and the right wheel opposite, which turned
+        # a real R-series droid the wrong way (Right spun it counter-clockwise). To turn left the
+        # left wheel must go backwards and the right wheel forwards, so the wheels are swapped here.
+        opposite = DroidMotorDirection.Left if direction == DroidMotorDirection.Right else DroidMotorDirection.Right
+        await self.set_motor_speed(opposite, DroidMotorIdentifier.LeftMotor, speed, ramp_speed)
+        await self.set_motor_speed(direction, DroidMotorIdentifier.RightMotor, speed, ramp_speed)
 
     async def set_head_speed(self, direction: int, speed: int = 160, ramp_speed: int = 300) -> None:
         """
